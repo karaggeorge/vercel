@@ -416,6 +416,8 @@ export const build: BuildV3 = async ({
     isEdgeFunction = isEdgeRuntime(staticConfig.runtime);
   }
 
+  const cron = staticConfig?.cron;
+
   debug('Tracing input files...');
   const traceTime = Date.now();
   const { preparedFiles, shouldAddSourcemapSupport } = await compile(
@@ -486,7 +488,7 @@ export const build: BuildV3 = async ({
     });
   }
 
-  return { routes, output };
+  return { routes, output, cron };
 };
 
 export const prepareCache: PrepareCache = ({ repoRootPath, workPath }) => {

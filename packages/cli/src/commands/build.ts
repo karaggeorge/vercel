@@ -16,7 +16,9 @@ import {
   BuildResultV2Typical,
   BuildResultV3,
   NowBuildError,
+  Cron,
 } from '@vercel/build-utils';
+import cronValidate from 'cron-validate';
 import {
   detectBuilders,
   detectFrameworkRecord,
@@ -52,11 +54,12 @@ import confirm from '../util/input/confirm';
 import { emoji, prependEmoji } from '../util/emoji';
 import stamp from '../util/output/stamp';
 import {
+  getBuildV3Path,
   OUTPUT_DIR,
   PathOverride,
   writeBuildResult,
 } from '../util/build/write-build-result';
-import { importBuilders } from '../util/build/import-builders';
+import { BuilderWithPkg, importBuilders } from '../util/build/import-builders';
 import { initCorepack, cleanupCorepack } from '../util/build/corepack';
 import { sortBuilders } from '../util/build/sort-builders';
 import { toEnumerableError } from '../util/error';
@@ -604,6 +607,7 @@ async function doBuild(
   const mergedWildcard = mergeWildcard(buildResults.values());
   const mergedOverrides: Record<string, PathOverride> =
     overrides.length > 0 ? Object.assign({}, ...overrides) : undefined;
+  const mergedCron = await mergeCron(buildResults.entries(), buildersWithPkgs);
 
   const framework = await getFramework(cwd, buildResults);
 
@@ -615,6 +619,7 @@ async function doBuild(
     images: mergedImages,
     wildcard: mergedWildcard,
     overrides: mergedOverrides,
+    crons: mergedCron,
     framework,
   };
   await fs.writeJSON(join(outputDir, 'config.json'), config, { spaces: 2 });
@@ -735,4 +740,79 @@ function mergeWildcard(
     }
   }
   return wildcard;
+}
+
+async function mergeCron(
+  builds: Iterable<[Builder, BuildResult]>,
+  builders: Map<string, BuilderWithPkg>
+): Promise<Cron[]> {
+  let crons: Cron[] = [];
+
+  const addAndValidate = (...cronsToAdd: Cron[]) => {
+    for (const cronToAdd of cronsToAdd) {
+      const cronValidationResult = cronValidate(cronToAdd.cron);
+      if (!cronValidationResult.isValid()) {
+        throw new Error(
+          `Invalid cron expression for ${cronToAdd.path}, "${
+            cronToAdd.cron
+          }": ${cronValidationResult.getError()[0]}`
+        );
+      }
+
+      crons.push(cronToAdd);
+    }
+  };
+
+  // Loop through all builds
+  for (const [build, buildResult] of builds) {
+    const builderPkg = builders.get(build.use);
+
+    if (!builderPkg) {
+      throw new Error(`Builder ${build.use} not found`);
+    }
+
+    const { version } = builderPkg.builder;
+
+    if (typeof version !== 'number' || version === 2) {
+      // If we have a V2 builder
+      const buildResultV2 = buildResult as BuildResultV2;
+
+      if ('buildOutputPath' in buildResultV2) {
+        // If it's a BuildResultBuildOutput result, we need to merge the cron from that output's config.json file
+        const buildConfigFile = await readJSONFile<{ cron?: Cron[] }>(
+          join(buildResultV2.buildOutputPath, 'config.json')
+        );
+
+        if (buildConfigFile instanceof CantParseJSONFile) throw buildConfigFile;
+
+        if (buildConfigFile?.cron && Array.isArray(buildConfigFile.cron)) {
+          addAndValidate(...buildConfigFile.cron);
+        }
+      } else {
+        // Otherwise, we just get the crons field from the typical V2 result
+        if (buildResultV2.crons && Array.isArray(buildResultV2.crons)) {
+          addAndValidate(...buildResultV2.crons);
+        }
+      }
+    } else if (version === 3) {
+      // If we have a V3 builder, we get the cron field from the result, and construct the path based on the build src
+      const buildResultV3 = buildResult as BuildResultV3;
+
+      if (buildResultV3.cron) {
+        addAndValidate({
+          path: getBuildV3Path(build),
+          cron: buildResultV3.cron,
+        });
+      }
+    } else {
+      throw new Error(
+        `Unsupported Builder version \`${version}\` from "${builderPkg.pkg.name}"`
+      );
+    }
+  }
+
+  return crons.map(cron => ({
+    ...cron,
+    path: cron.path.startsWith('/') ? cron.path : `/${cron.path}`,
+  }));
 }
